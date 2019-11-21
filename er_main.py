@@ -47,16 +47,20 @@ parser.add_argument('--update_buffer_hid', type=int, default=1,
 # logging
 parser.add_argument('-l', '--log', type=str, default='off', choices=['off', 'online'],
     help='enable WandB logging')
-parser.add_argument('--wandb_project', type=str, default='mir',
+parser.add_argument('--wandb_project', type=str, default='mir_fast',
     help='name of the WandB project')
 
 #------ MIR -----#
 parser.add_argument('-m','--method', type=str, default='no_rehearsal', choices=['no_rehearsal',
-    'rand_replay', 'mir_replay'])
+    'rand_replay', 'mir_replay','oth_cl_neib_replay','oth_cl_neib_replay_far_fix','oth_cl_neib_replay_mid_fix'])
+#oth_cl_neib_replay:nearest neighbour retrieval
+#oth_cl_neib_replay_mid_fix: retrieve mid distance points for the KL update
+#oth_cl_neib_replay_mid_fix: retrieve far  points for the KL update
 parser.add_argument('--compare_to_old_logits', action='store_true',help='uses old logits')
 parser.add_argument('--reuse_samples', type=int, default=0)
 parser.add_argument('--lr', type=float, default=0.1)
-
+parser.add_argument('--kl_far', type=float, default=1)
+parser.add_argument('--multiplier', type=float, default=1)
 args = parser.parse_args()
 
 # Obligatory overhead
@@ -96,17 +100,17 @@ if args.reproc:
     seed=0
     torch.manual_seed(seed)
     np.random.seed(seed)
-
+pre_defined_n_tasks=args.n_tasks
 # fetch data
 data = locate('data.get_%s' % args.dataset)(args)
 
 # make dataloaders
 train_loader, val_loader, test_loader  = [CLDataLoader(elem, args, train=t) \
         for elem, t in zip(data, [True, False, False])]
-
+args.n_tasks=pre_defined_n_tasks
 if args.log != 'off':
     import wandb
-    wandb.init(args.wandb_project)
+    wandb.init(args.wandb_project, name=args.suffix)
     wandb.config.update(args)
 else:
     wandb = None
@@ -119,7 +123,6 @@ args.mem_size = args.mem_size*args.n_classes #convert from per class to total me
 
 # Train the model
 # -----------------------------------------------------------------------------------------
-
 for run in range(args.n_runs):
 
     # REPRODUCTIBILITY
@@ -146,7 +149,9 @@ for run in range(args.n_runs):
 
     #----------
     # Task Loop
+
     for task, tr_loader in enumerate(train_loader):
+
         sample_amt = 0
 
         model = model.train()
@@ -164,6 +169,7 @@ for run in range(args.n_runs):
 
             #------ Train Classifier-------#
             if i==0:
+
                 print('\n--------------------------------------')
                 print('Run #{} Task #{} --> Train Classifier'.format(
                     run, task))
@@ -212,13 +218,18 @@ for run in range(args.n_runs):
             print('\n{}:'.format(mode))
             print(LOG[run][mode]['acc'])
 
+        if (task+1)==pre_defined_n_tasks:
+
+            break
 
     # final run results
     print('--------------------------------------')
     print('Run #{} Final Results'.format(run))
     print('--------------------------------------')
+    #import pdb
+    #pdb.set_trace()
     for mode in ['valid','test']:
-        final_accs = LOG[run][mode]['acc'][:,task]
+        final_accs = LOG[run][mode]['acc'][:task+1,task]
         logging_per_task(wandb, LOG, run, mode, 'final_acc', task,
             value=np.round(np.mean(final_accs),2))
         best_acc = np.max(LOG[run][mode]['acc'], 1)
@@ -226,12 +237,14 @@ for run in range(args.n_runs):
         logging_per_task(wandb, LOG, run, mode, 'final_forget', task,
             value=np.round(np.mean(final_forgets[:-1]),2))
 
+        LOG[run][mode]['last_task_acc'] =(LOG[run][mode]['acc'][:task+1,task][-1])
+        LOG[run][mode]['allbutfirst_tasks_acc'] =np.mean(LOG[run][mode]['acc'][:task+1,task][:-1])
         print('\n{}:'.format(mode))
         print('final accuracy: {}'.format(final_accs))
         print('average: {}'.format(LOG[run][mode]['final_acc']))
         print('final forgetting: {}'.format(final_forgets))
-        print('average: {}\n'.format(LOG[run][mode]['final_forget']))
-
+        print('last task acc: {}\n'.format(LOG[run][mode]['last_task_acc']))
+        print('all but last task acc: {}\n'.format(LOG[run][mode]['allbutfirst_tasks_acc']))
 
 # final results
 print('--------------------------------------')
@@ -247,10 +260,12 @@ for mode in ['valid','test']:
     final_forgets = [LOG[x][mode]['final_forget'] for x in range(args.n_runs)]
     final_forget_avg = np.mean(final_forgets)
     final_forget_se = 2*np.std(final_forgets) / np.sqrt(args.n_runs)
-
+    final_last_task_acc= np.mean( [LOG[x][mode]['last_task_acc'] for x in range(args.n_runs)])
+    final_allbutfirst_tasks_acc = np.mean([LOG[x][mode]['allbutfirst_tasks_acc'] for x in range(args.n_runs)])
     print('\nFinal {} Accuracy: {:.3f} +/- {:.3f}'.format(mode, final_acc_avg, final_acc_se))
     print('\nFinal {} Forget: {:.3f} +/- {:.3f}'.format(mode, final_forget_avg, final_forget_se))
-
+    print('\nFinal {} final_last_task_acc: {:.3f}'.format(mode, final_last_task_acc))
+    print('\nFinal {} final_allbutfirst_tasks_acc: {:.3f}'.format(mode, final_allbutfirst_tasks_acc))
     if name_log_txt is not None:
         with open(name_log_txt, "a") as text_file:
             print('\nFinal {} Accuracy: {:.3f} +/- {:.3f}'.format(mode, final_acc_avg, final_acc_se), file=text_file)
@@ -261,4 +276,5 @@ for mode in ['valid','test']:
         wandb.log({mode+'final_acc_se':final_acc_se})
         wandb.log({mode+'final_forget_avg':final_forget_avg})
         wandb.log({mode+'final_forget_se':final_forget_se})
-
+        wandb.log({mode+'final_last_task_acc':final_last_task_acc})
+        wandb.log({mode+'final_allbutfirst_tasks_acc':final_allbutfirst_tasks_acc})

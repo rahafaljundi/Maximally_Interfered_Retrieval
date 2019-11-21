@@ -26,7 +26,24 @@ def overwrite_grad(pp, new_grad, grad_dims):
             param.data.size())
         param.grad.data.copy_(this_grad)
         cnt += 1
+def add_grad(pp, new_grad, grad_dims):
+    """
+        This is used to overwrite the gradients with a new gradient
+        vector, whenever violations occur.
+        pp: parameters
+        newgrad: corrected gradient
+        grad_dims: list storing number of parameters at each layer
+    """
+    cnt = 0
+    for param in pp():
+        #param.grad=torch.zeros_like(param.data)
+        beg = 0 if cnt == 0 else sum(grad_dims[:cnt])
+        en = sum(grad_dims[:cnt + 1])
+        this_grad = new_grad[beg: en].contiguous().view(
+            param.data.size())
 
+        param.grad.data.add_(this_grad)
+        cnt += 1
 def get_grad_vector(args, pp, grad_dims):
     """
      gather the gradients in one vector
@@ -57,6 +74,21 @@ def get_future_step_parameters(this_net,grad_vector,grad_dims,lr=1):
         for param in new_net.parameters():
             if param.grad is not None:
                 param.data=param.data - lr*param.grad.data
+    return new_net
+
+def get_future_step_parameters_with_grads(this_net,grad_vector,grad_dims,lr=1):
+    """
+    computes \theta-\delta\theta
+    :param this_net:
+    :param grad_vector:
+    :return:
+    """
+    new_net=copy.deepcopy(this_net)
+    overwrite_grad(new_net.parameters,grad_vector,grad_dims)
+    for name, param in this_net.named_parameters():
+        for namex, paramx in new_net.named_parameters():
+            if namex==name:
+                paramx=param - lr*param.grad
     return new_net
 
 def get_grad_dims(self):
@@ -167,7 +199,8 @@ def get_logger(names, n_runs=1, n_tasks=None):
 
             log[i][mode]['final_acc'] = 0.
             log[i][mode]['final_forget'] = 0.
-
+            log[i][mode]['last_task_acc'] = 0.
+            log[i][mode]['allbutfirst_tasks_acc'] = 0.
     return log
 
 def get_temp_logger(exp, names):

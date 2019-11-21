@@ -6,12 +6,13 @@ import pdb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import get_grad_vector, get_future_step_parameters
+from utils import get_grad_vector, get_future_step_parameters,add_grad,distillation_KL_loss,get_future_step_parameters_with_grads
 from VAE.loss import calculate_loss
 
 #----------
 # Functions
 dist_kl = lambda y, t_s : F.kl_div(F.log_softmax(y, dim=-1), F.softmax(t_s, dim=-1), reduction='mean') * y.size(0)
+
 # this returns -entropy
 entropy_fn = lambda x : torch.sum(F.softmax(x, dim=-1) * F.log_softmax(x, dim=-1), dim=-1)
 
@@ -315,7 +316,7 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
     if not rehearse:
         opt.step()
         return model
-
+#####################################################################################################
     if args.method == 'mir_replay':
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
         grad_dims = []
@@ -353,16 +354,176 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
             idx = subsample[big_ind]
 
         mem_x, mem_y, logits_y, b_task_ids = bx[big_ind], by[big_ind], buffer.logits[idx], bt[big_ind]
-    else:
-        mem_x, mem_y, bt = buffer.sample(args.buffer_batch_size, exclude_task=task)
 
-    logits_buffer = model(mem_x)
-    if args.multiple_heads:
-        mask = torch.zeros_like(logits_buffer)
-        mask.scatter_(1, loader.dataset.task_ids[b_task_ids], 1)
-        assert mask.nelement() // mask.sum() == args.n_tasks
-        logits_buffer = logits_buffer.masked_fill(mask == 0, -1e9)
-    F.cross_entropy(logits_buffer, mem_y).backward()
+##############################Nearest Neighbours###############################################
+    if args.method == 'oth_cl_neib_replay':
+        bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
+
+        #get representation
+        b_hidden= model.return_hidden(bx)
+        input_hidden= model.return_hidden(input_x)
+
+
+        indices=[]
+        buffer_per_sample=int(args.buffer_batch_size/input_x.size(0))
+
+        for sample in input_hidden:
+            pdist = nn.PairwiseDistance(p=2)
+            input_rep = sample.repeat(b_hidden.size(0),1)
+
+            dist_to_all = pdist(b_hidden, input_rep)
+
+            _,sorted_indices = torch.sort(dist_to_all)
+            added=0
+            #pdb.set_trace()
+            for new_added_index in sorted_indices:
+
+                if not new_added_index in indices:
+                    indices.append(new_added_index)
+                    added+=1
+                    if added==buffer_per_sample:
+                        break
+
+        indices=torch.tensor(indices)
+        mem_x=bx[indices]
+        mem_y= by[indices]
+        bt = bt[indices]
+##################################################################################
+    if args.method == 'oth_cl_neib_replay_far_fix':
+
+        bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
+        grad_dims = []
+        for param in model.parameters():
+            grad_dims.append(param.data.numel())
+        grad_vector = get_grad_vector(args, model.parameters, grad_dims)
+        model_temp = get_future_step_parameters(model, grad_vector, grad_dims, lr=args.lr)
+        model_temp.zero_grad()
+
+        b_hidden = model.return_hidden(bx)
+        input_hidden = model.return_hidden(input_x)
+
+        # dist_to_all=torch.zeros(bx.size(0)).cuda()+1e4
+        close_indices = []
+        far_indices=[]
+        buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
+        for sample in input_hidden:
+            pdist = nn.PairwiseDistance(p=2)
+            input_rep = sample.repeat(b_hidden.size(0), 1)
+
+            dist_to_all = pdist(b_hidden, input_rep)
+
+            _, sorted_indices = torch.sort(dist_to_all)
+            added = 0
+
+            backward_index=len(sorted_indices)-1
+            for new_added_index in sorted_indices:
+
+                if not new_added_index in close_indices:
+                    close_indices.append(new_added_index)
+                    added += 1
+
+
+                if added == buffer_per_sample:
+                    break
+
+            while backward_index>=0:
+                if not sorted_indices[backward_index] in far_indices  and not sorted_indices[backward_index] in close_indices:
+                    far_indices.append(sorted_indices[backward_index])
+                    break
+                backward_index -= 1
+
+        close_indices = torch.tensor(close_indices)
+
+        mem_x = bx[close_indices]
+        mem_y = by[close_indices]
+        bt = bt[close_indices]
+
+        far_indices = torch.tensor(far_indices)
+        with torch.no_grad():
+            curr_bf_hidden=model(bx[far_indices])
+
+        KL =args.kl_far*dist_kl(curr_bf_hidden, model_temp(bx[far_indices]))
+        KL.backward()
+        meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
+        add_grad(model.parameters, meta_grad_vector, grad_dims)
+###########################################################################################
+    if args.method == 'oth_cl_neib_replay_mid_fix':
+
+        bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
+
+
+        b_hidden = model.return_hidden(bx)
+        input_hidden = model.return_hidden(input_x)
+
+        # Updating nearby samples
+        close_indices = []
+
+        all_dist=torch.zeros(args.subsample).cuda()
+        buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
+        for sample in input_hidden:
+            pdist = nn.PairwiseDistance(p=2)
+            input_rep = sample.repeat(b_hidden.size(0), 1)
+
+            dist_to_all = pdist(b_hidden, input_rep)
+            all_dist+=dist_to_all
+            _, sorted_indices = torch.sort(dist_to_all)
+            added = 0
+            for new_added_index in sorted_indices:
+
+                if not new_added_index in close_indices:
+                    close_indices.append(new_added_index)
+                    added += 1
+
+                if added == buffer_per_sample:
+                    break
+        #Not neighbouring indices
+
+       
+        _, sorted_indices = torch.sort(all_dist/args.buffer_batch_size)
+        not_neighnor_inds=[ x for x in sorted_indices if x not in close_indices]
+        far_indices = torch.tensor(not_neighnor_inds[int(len(not_neighnor_inds) /2):min(len(not_neighnor_inds),int(len(not_neighnor_inds) /2)+len(close_indices))])
+
+        close_indices = torch.tensor(close_indices)
+
+        mem_x = bx[close_indices]
+        mem_y = by[close_indices]
+        bt = bt[close_indices]
+
+        #FIXING KL
+        logits_buffer = model(mem_x)
+        (args.multiplier * F.cross_entropy(logits_buffer, mem_y)).backward()
+        grad_dims = []
+        for param in model.parameters():
+            grad_dims.append(param.data.numel())
+        grad_vector = get_grad_vector(args, model.parameters, grad_dims)
+        model_temp = get_future_step_parameters_with_grads(model, grad_vector, grad_dims, lr=args.lr)
+        far_indices = torch.tensor(far_indices)
+        #with torch.no_grad():
+        #    curr_bf_hidden=model(bx[far_indices])
+
+        #KL=args.kl_far * distillation_KL_loss( model_temp(bx[far_indices]),curr_bf_hidden,T=2)
+        #KL =args.kl_far*dist_kl( model_temp(bx[far_indices]),curr_bf_hidden)
+        KL=- args.kl_far *(F.softmax(model(bx[far_indices]).detach(), dim=1) * F.log_softmax(model_temp(bx[far_indices]), dim=1)).sum(dim=1).mean()
+
+        KL.backward()
+        meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
+        add_grad(model.parameters, meta_grad_vector, grad_dims)
+
+##############################################################################################
+    if args.method== 'rand_replay':
+        mem_x, mem_y, bt = buffer.sample(args.buffer_batch_size, exclude_task=task)
+    if not   args.method == 'oth_cl_neib_replay_mid_fix':
+        logits_buffer = model(mem_x)
+        if args.multiple_heads:
+            mask = torch.zeros_like(logits_buffer)
+            mask.scatter_(1, loader.dataset.task_ids[b_task_ids], 1)
+            assert mask.nelement() // mask.sum() == args.n_tasks
+            logits_buffer = logits_buffer.masked_fill(mask == 0, -1e9)
+
+
+
+        (args.multiplier*F.cross_entropy(logits_buffer, mem_y)).backward()
+
 
     if updated_inds is not None:
         buffer.logits[subsample[updated_inds]] = deepcopy(logits_track_pre[updated_inds])
