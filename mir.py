@@ -6,7 +6,7 @@ import pdb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import get_grad_vector, get_future_step_parameters,add_grad,distillation_KL_loss,get_future_step_parameters_with_grads
+from utils import get_grad_vector, get_future_step_parameters,add_grad,get_weight_accumelated_gradient_norm,weight_gradient_norm,get_future_step_parameters_with_grads
 from VAE.loss import calculate_loss
 
 #----------
@@ -301,6 +301,9 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 
 
     updated_inds = None
+    if args.imprint:
+
+        imprint(model,input_x,input_y,args.imprint>1)
 
     hid = model.return_hidden(input_x)
 
@@ -312,10 +315,14 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 
     opt.zero_grad()
     loss.backward()
-
+    if args.friction:
+        get_weight_accumelated_gradient_norm(model)
     if not rehearse:
+
         opt.step()
+
         return model
+
 #####################################################################################################
     if args.method == 'mir_replay':
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
@@ -360,9 +367,10 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
 
         #get representation
+        model.eval()
         b_hidden= model.return_hidden(bx)
         input_hidden= model.return_hidden(input_x)
-
+        model.train()
 
         indices=[]
         buffer_per_sample=int(args.buffer_batch_size/input_x.size(0))
@@ -451,10 +459,10 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
 
-
+        model.eval()
         b_hidden = model.return_hidden(bx)
         input_hidden = model.return_hidden(input_x)
-
+        model.train()
         # Updating nearby samples
         close_indices = []
 
@@ -527,9 +535,50 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 
     if updated_inds is not None:
         buffer.logits[subsample[updated_inds]] = deepcopy(logits_track_pre[updated_inds])
+
+    if args.friction:
+        get_weight_accumelated_gradient_norm(model)
+        weight_gradient_norm(model,args.friction)
+
+
     opt.step()
+
     return model
 
+def imprint(model,X,Y,rand=False):
+    with torch.no_grad():
+        classes=torch.unique(Y)
+
+        pre_classes_nb=model.classifier.fc.weight.size(0)
+        pre_layer_dim=model.classifier.fc.weight.size(1)
+        if pre_classes_nb<=min(classes):
+
+            weight = torch.cat((model.classifier.fc.weight, torch.randn((model.nb_classes),pre_layer_dim).cuda()))
+            model.classifier.fc = nn.Linear(pre_layer_dim, model.nb_classes + len(model.seen_classes),
+                                            bias=False).cuda()
+            model.classifier.fc.weight.data = weight
+            print("new group of classes, current size", model.classifier.fc.weight.data.size())
+            #new classes are recieved
+        Flag=False
+        for cl in classes:
+            if not cl in model.seen_classes:
+                if not Flag:
+                    model.eval()
+                    Feat = model.extract(X)
+                    model.train()
+                    Flag=True
+
+                print("new class imprinting",cl)
+                if  rand:
+                    print("Random Imprinting")
+                tmp = Feat[Y == (cl )].mean(0) if not rand else torch.randn(pre_layer_dim)
+                model.classifier.fc.weight.data[cl] = tmp / tmp.norm(p=2)
+
+                model.seen_classes.append(cl)
+
+
+
+                
 '''OLD'''
 def max_z_for_cls(args, virtual_cls, prev_cls, prev_gen, z_mu, z_var, z_t, gradient_steps=10, budget=10):
 

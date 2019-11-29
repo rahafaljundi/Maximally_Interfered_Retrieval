@@ -9,7 +9,7 @@ from utils  import get_logger, get_temp_logger, logging_per_task
 from buffer import Buffer
 from copy   import deepcopy
 from pydoc  import locate
-from model  import ResNet18, MLP
+from model  import ResNet18, MLP,ResNet18_imprint
 
 # Arguments
 # -----------------------------------------------------------------------------------------
@@ -44,6 +44,8 @@ parser.add_argument('--print_every', type=int, default=500,
     help="print metrics every this iteration")
 parser.add_argument('--update_buffer_hid', type=int, default=1,
     help='related to latent buffer')
+parser.add_argument('--imprint', type=int, default=0,
+    help='Use weight imprinting for new classes')
 # logging
 parser.add_argument('-l', '--log', type=str, default='off', choices=['off', 'online'],
     help='enable WandB logging')
@@ -61,6 +63,7 @@ parser.add_argument('--reuse_samples', type=int, default=0)
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--kl_far', type=float, default=1)
 parser.add_argument('--multiplier', type=float, default=1)
+parser.add_argument('--friction', type=float, default=0)
 args = parser.parse_args()
 
 # Obligatory overhead
@@ -134,7 +137,12 @@ for run in range(args.n_runs):
 
     # CLASSIFIER
     if args.use_conv:
-        model = ResNet18(args.n_classes, nf=20, input_size=args.input_size)
+        if args.imprint:
+
+            model = ResNet18_imprint(num_classes=args.n_tasks*5)
+            model.seen_classes = []
+        else:
+            model = ResNet18(args.n_classes, nf=20, input_size=args.input_size)
     else:
         model = MLP(args)
     if args.cuda:

@@ -73,6 +73,7 @@ def get_future_step_parameters(this_net,grad_vector,grad_dims,lr=1):
     with torch.no_grad():
         for param in new_net.parameters():
             if param.grad is not None:
+
                 param.data=param.data - lr*param.grad.data
     return new_net
 
@@ -95,6 +96,72 @@ def get_grad_dims(self):
     self.grad_dims = []
     for param in self.net.parameters():
         self.grad_dims.append(param.data.numel())
+
+
+def weight_gradient_norm(model,friction):
+    normalized_friction_weight(model,friction)
+    min=1
+    if not hasattr(model,"mingr"):
+        model.mingr=min
+    for name, param in model.named_parameters():
+
+        if not "linear" in name and param.grad is not None:
+            if friction==1:
+                friction_val=get_friction(param.gr_norm,mu=1)
+                if float(torch.min(friction_val))<model.mingr:
+
+                    print("MIN",float(torch.min(friction_val)) )
+                    model.mingr=torch.min(friction_val)
+                param.grad.data = friction * param.grad.data * friction_val
+
+            else:
+                param.grad.data = friction * param.grad.data * param.gr_norm_maxmin
+
+def weight_friction(model,friction):
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.data = friction*param.grad.data*get_friction(param.data)
+
+def get_friction(w,mu=1):
+
+    term=torch.exp(mu*w)
+    #friction=torch.div(4*term,torch.pow(1+term,2))
+
+    friction = torch.exp(-mu * torch.pow(w,2))
+
+
+    return friction
+
+def get_weight_accumelated_gradient_norm(model):
+
+    if not hasattr(model,'stepcount'):
+        model.stepcount=1
+    for w in model.parameters():
+        if not hasattr(w,"gr_norm") and  w.grad is not None:
+            w.gr_norm=torch.zeros(w.data.size()).cuda()
+            print("creating gr_norm")
+
+        if w.grad is not None:
+            w.gr_norm =((w.gr_norm*(model.stepcount-1)+ torch.abs(w.grad.data).clone())/model.stepcount)
+
+    model.stepcount += 1
+
+    return model
+
+def normalized_friction_weight(model,friction):
+    if friction==2:
+        max_accgr=0
+        min_accgr= 0
+        for w in model.parameters():
+            if  hasattr(w,"gr_norm") :
+                max_accgr = max(max_accgr, torch.max(w.gr_norm))
+                min_accgr = min(min_accgr, torch.min(w.gr_norm))
+        for w in model.parameters():
+            if  hasattr(w,"gr_norm") :
+
+                w.gr_norm_maxmin=1- ((w.gr_norm-min_accgr)/(max_accgr-min_accgr))
+
+    return model
 
 ''' Others '''
 def onehot(t, num_classes, device='cpu'):
