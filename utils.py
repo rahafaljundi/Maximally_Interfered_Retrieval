@@ -44,6 +44,8 @@ def add_grad(pp, new_grad, grad_dims):
 
         param.grad.data.add_(this_grad)
         cnt += 1
+
+
 def get_grad_vector(args, pp, grad_dims):
     """
      gather the gradients in one vector
@@ -77,7 +79,194 @@ def get_future_step_parameters(this_net,grad_vector,grad_dims,lr=1):
                 param.data=param.data - lr*param.grad.data
     return new_net
 
-def get_future_step_parameters_with_grads(this_net,grad_vector,grad_dims,lr=1):
+def optimize(args,model,opt,input_x,input_y,mem_x,mem_y,far_mem_x,task):
+
+
+    if args.mask:  # MASK OUT UN Replayed or seen classes
+        yy = torch.cat((input_y, mem_y), dim=0)
+
+        mask = get_mask_unused_memories(yy, args.n_classes)
+    inner_iter=1
+    while True:
+
+        logits=model(input_x)
+        logits_buffer = model(mem_x)
+        if args.mask:
+            logits = logits.masked_fill(mask, 1e-9)
+            logits_buffer = logits_buffer.masked_fill(mask, 1e-9)
+
+        loss = F.cross_entropy(logits, input_y)
+        loss.backward()  # Loss of the new batch
+        b_loss=(args.multiplier * F.cross_entropy(logits_buffer, mem_y))
+        b_loss.backward()#Loss of the neighbours
+        grad_dims = []
+        for param in model.parameters():
+            grad_dims.append(param.data.numel())
+        model_temp = get_future_step_parameters_with_grads(model,  args.lr)
+
+        KL=- args.kl_far *(F.softmax(model(far_mem_x).detach(), dim=1) * F.log_softmax(model_temp(far_mem_x), dim=1)).sum(dim=1).mean()
+        
+        KL.backward()
+        meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
+        add_grad(model.parameters, meta_grad_vector, grad_dims)
+
+        if args.friction:
+            get_weight_accumelated_gradient_norm(model)
+            weight_gradient_norm(model, args.friction)
+        if args.kl_far == -1:
+            weight_loss = get_weight_norm_diff(model, task=task, cl=5)
+            weight_loss.backward()
+        opt.step()
+
+        if 0.5*(loss+b_loss)<0.1 or inner_iter==args.conv_iter :
+            #if inner_iter==args.conv_iter :
+            #    print("****************inner_iter", inner_iter, float(loss + b_loss))
+            return
+        inner_iter+=1
+
+
+def rand_optimize(args, model, opt, input_x, input_y, mem_x, mem_y,task):
+    model.zero_grad()
+    if args.mask:  # MASK OUT UN Replayed or seen classes
+        yy = torch.cat((input_y, mem_y), dim=0)
+
+        mask = get_mask_unused_memories(yy, args.n_classes)
+    inner_iter = 1
+    while True:
+
+        logits = model(input_x)
+        logits_buffer = model(mem_x)
+        if args.mask:
+            logits = logits.masked_fill(mask, 1e-9)
+            logits_buffer = logits_buffer.masked_fill(mask, 1e-9)
+
+        loss = F.cross_entropy(logits, input_y)
+        loss.backward()  # Loss of the new batch
+        b_loss = (args.multiplier * F.cross_entropy(logits_buffer, mem_y))
+        b_loss.backward()  # Loss of the neighbours
+
+        if args.friction:
+            get_weight_accumelated_gradient_norm(model)
+            weight_gradient_norm(model, args.friction)
+        if args.kl_far == -1:
+            weight_loss = get_weight_norm_diff(model, task=task, cl=5)
+            weight_loss.backward()
+        opt.step()
+
+        if 0.5 * (loss + b_loss) < 0.1 or inner_iter == args.conv_iter:
+            #if inner_iter == args.conv_iter:
+                #print("****************inner_iter", inner_iter, float(loss + b_loss))
+            return
+        inner_iter += 1
+def compute_lossgrad(args,model,input_x,input_y,mem_x,mem_y,far_mem_x):
+
+    if args.mask:  # MASK OUT UN Replayed or seen classes
+        yy = torch.cat((input_y, mem_y), dim=0)
+
+        mask = get_mask_unused_memories(yy, args.n_classes)
+
+
+    logits=model(input_x)
+    logits_buffer = model(mem_x)
+    if args.mask:
+        logits = logits.masked_fill(mask, 1e-9)
+        logits_buffer = logits_buffer.masked_fill(mask, 1e-9)
+
+    #those will be already computed if not masking
+    #
+        loss = F.cross_entropy(logits, input_y)
+        loss.backward()  # Loss of the new batch
+
+    b_loss=(args.multiplier * F.cross_entropy(logits_buffer, mem_y))
+    b_loss.backward()#Loss of the neighbours
+    grad_dims = []
+    for param in model.parameters():
+        grad_dims.append(param.data.numel())
+    model_temp = get_future_step_parameters_with_grads(model,  args.lr)
+
+    KL=- args.kl_far *(F.softmax(model(far_mem_x).detach(), dim=1) * F.log_softmax(model_temp(far_mem_x), dim=1)).sum(dim=1).mean()
+    #print("task",task,"loss",float(loss),"b_loss",float(b_loss),"KL value",float(KL))
+    KL.backward()
+    meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
+    add_grad(model.parameters, meta_grad_vector, grad_dims)
+
+
+def get_nearbysamples(args,input_x,input_hidden,b_hidden,b_y):
+
+
+    if args.balanced:
+        return get_blnearbysamples(args,input_x,input_hidden,b_hidden,b_y)
+    close_indices = []
+    all_dist = torch.zeros(args.subsample).cuda()
+    buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
+    added_labels= torch.unique(b_y).cpu().numpy().tolist()
+    for sample in input_hidden:
+        pdist = torch.nn.PairwiseDistance(p=2)
+        input_rep = sample.repeat(b_hidden.size(0), 1)
+
+        dist_to_all = pdist(b_hidden, input_rep)
+        try:
+            all_dist += dist_to_all
+        except:
+            pdb.set_trace()
+        _, sorted_indices = torch.sort(dist_to_all)
+        added = 0
+
+        for new_added_index in sorted_indices:
+
+            if not new_added_index in close_indices and  int(b_y[new_added_index]) in added_labels:
+
+                close_indices.append(new_added_index)
+                added_labels.remove(int(b_y[new_added_index]))
+                added += 1
+                if len(added_labels) ==0:
+                    added_labels = torch.unique(b_y).cpu().numpy().tolist()
+
+            if added == buffer_per_sample:
+                break
+
+    return close_indices,all_dist
+
+
+def get_blnearbysamples(args,input_x,input_hidden,b_hidden,b_y):
+    close_indices = []
+    all_dist = torch.zeros(args.subsample).cuda()
+    buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
+    added_labels= torch.unique(b_y).cpu().numpy().tolist()
+    for sample in input_hidden:
+        pdist = torch.nn.PairwiseDistance(p=2)
+        input_rep = sample.repeat(b_hidden.size(0), 1)
+
+        dist_to_all = pdist(b_hidden, input_rep)
+        try:
+            all_dist += dist_to_all
+        except:
+            pdb.set_trace()
+        _, sorted_indices = torch.sort(dist_to_all)
+        added = 0
+
+        for new_added_index in sorted_indices:
+
+            if not new_added_index in close_indices and  int(b_y[new_added_index]) in added_labels:
+
+                close_indices.append(new_added_index)
+                added_labels.remove(int(b_y[new_added_index]))
+                added += 1
+                if len(added_labels) ==0:
+                    added_labels = torch.unique(b_y).cpu().numpy().tolist()
+
+            if added == buffer_per_sample:
+                break
+
+    return close_indices,all_dist
+def get_mask_unused_memories(Y,nb_classes):
+
+    xx = torch.range(0, nb_classes-1).cuda()
+
+    not_in_labels = Y.view(1, -1).eq(xx.view(-1, 1)).sum(1)
+    mask = torch.eq(not_in_labels, 0)
+    return mask
+def get_future_step_parameters_with_grads(this_net,lr=1):
     """
     computes \theta-\delta\theta
     :param this_net:
@@ -85,10 +274,11 @@ def get_future_step_parameters_with_grads(this_net,grad_vector,grad_dims,lr=1):
     :return:
     """
     new_net=copy.deepcopy(this_net)
-    overwrite_grad(new_net.parameters,grad_vector,grad_dims)
+    #new_net=this_net
     for name, param in this_net.named_parameters():
         for namex, paramx in new_net.named_parameters():
             if namex==name:
+
                 paramx=param - lr*param.grad
     return new_net
 
@@ -116,6 +306,29 @@ def weight_gradient_norm(model,friction):
 
             else:
                 param.grad.data = friction * param.grad.data * param.gr_norm_maxmin
+def get_weight_norm_diff(model,beta=1,task=0,cl=5):
+    loss = 0
+    for name, param in model.named_parameters():
+        if "linear" in name:
+            for name1, param1 in model.named_parameters():
+                if "linear" in name1 and not name1==name:
+
+                    #pdb.set_trace()
+                    fullfc=torch.cat((param,param1.unsqueeze(1)),dim=1)
+                    norm_fullfc=torch.norm(fullfc,dim=1).unsqueeze(1)
+                    norm_fullfc_rep = norm_fullfc.repeat(1, norm_fullfc.size(0))
+                    
+                    with torch.no_grad():
+
+                        norm_fullfc_rep_t=norm_fullfc.repeat(1,norm_fullfc.size(0)).clone()
+                        norm_fullfc_rep_t=norm_fullfc_rep_t.transpose(0,1)
+                    loss=torch.dist(norm_fullfc_rep[cl*task:cl*(task+1)],norm_fullfc_rep_t[cl*task:cl*(task+1)])/(norm_fullfc_rep_t[cl*task:cl*(task+1)].size(0)*norm_fullfc_rep_t.size(0))
+                    print(loss)
+                    return beta * (loss)
+            # for neuron_weight in range(param.size(0)):
+            #     for other_neuron_weight in range(neuron_weight):
+            #         loss+=(1/neuron_weight)*torch.abs(torch.norm(param[neuron_weight])-torch.norm(param[other_neuron_weight]))
+
 
 def weight_friction(model,friction):
     for param in model.parameters():

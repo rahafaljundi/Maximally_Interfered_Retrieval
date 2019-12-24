@@ -38,11 +38,11 @@ class Buffer(nn.Module):
         bt = torch.LongTensor(buffer_size).fill_(0)
         logits = torch.FloatTensor(buffer_size, args.n_classes).fill_(0)
 
-        if args.cuda:
-            bx = bx.to(args.device)
-            by = by.to(args.device)
-            bt = bt.to(args.device)
-            logits = logits.to(args.device)
+        # if args.cuda:
+        #     bx = bx.to(args.device)
+        #     by = by.to(args.device)
+        #     bt = bt.to(args.device)
+        #     logits = logits.to(args.device)
 
         self.current_index = 0
         self.n_seen_so_far = 0
@@ -57,7 +57,8 @@ class Buffer(nn.Module):
         self.to_one_hot  = lambda x : x.new(x.size(0), args.n_classes).fill_(0).scatter_(1, x.unsqueeze(1), 1)
         self.arange_like = lambda x : torch.arange(x.size(0)).to(x.device)
         self.shuffle     = lambda x : x[torch.randperm(x.size(0))]
-
+        self.cuda=args.cuda
+        self.device=args.device
     @property
     def x(self):
         return self.bx[:self.current_index]
@@ -126,14 +127,15 @@ class Buffer(nn.Module):
         idx_new_data = valid_indices.nonzero().squeeze(-1)
         idx_buffer   = indices[idx_new_data]
 
+        try:
+            assert idx_buffer.max() < self.bx.size(0), pdb.set_trace()
+            assert idx_buffer.max() < self.by.size(0), pdb.set_trace()
+            assert idx_buffer.max() < self.bt.size(0), pdb.set_trace()
 
-        assert idx_buffer.max() < self.bx.size(0), pdb.set_trace()
-        assert idx_buffer.max() < self.by.size(0), pdb.set_trace()
-        assert idx_buffer.max() < self.bt.size(0), pdb.set_trace()
-       
-        assert idx_new_data.max() < x.size(0), pdb.set_trace()
-        assert idx_new_data.max() < y.size(0), pdb.set_trace()
-
+            assert idx_new_data.max() < x.size(0), pdb.set_trace()
+            assert idx_new_data.max() < y.size(0), pdb.set_trace()
+        except:
+            print("non of the new buffer samples is added")
         # perform overwrite op
         self.bx[idx_buffer] = x[idx_new_data]
         self.by[idx_buffer] = y[idx_new_data]
@@ -185,7 +187,10 @@ class Buffer(nn.Module):
             bx, by, bt = self.bx[valid_indices], self.by[valid_indices], self.bt[valid_indices]
         else:
             bx, by, bt = self.bx[:self.current_index], self.by[:self.current_index], self.bt[:self.current_index]
-
+        if self.cuda:
+            bx = bx.to(self.device)
+            by = by.to(self.device)
+            bt = bt.to(self.device)
         if bx.size(0) < amt:
             if ret_ind:
                 return bx, by, bt, torch.from_numpy(np.arange(bx.size(0)))

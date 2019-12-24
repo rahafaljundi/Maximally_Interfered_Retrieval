@@ -64,6 +64,11 @@ parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--kl_far', type=float, default=1)
 parser.add_argument('--multiplier', type=float, default=1)
 parser.add_argument('--friction', type=float, default=0)
+parser.add_argument('--mask', type=float, default=0)
+parser.add_argument('--balanced', type=float, default=0)
+parser.add_argument('--far', type=float, default=0)
+parser.add_argument('--untilconvergence', type=int, default=0)
+parser.add_argument('--conv_iter', type=int, default=0)
 args = parser.parse_args()
 
 # Obligatory overhead
@@ -99,10 +104,6 @@ args.newer = 2
 args.gen_epochs=0
 args.output_loss = None
 
-if args.reproc:
-    seed=0
-    torch.manual_seed(seed)
-    np.random.seed(seed)
 pre_defined_n_tasks=args.n_tasks
 # fetch data
 data = locate('data.get_%s' % args.dataset)(args)
@@ -126,15 +127,18 @@ args.mem_size = args.mem_size*args.n_classes #convert from per class to total me
 
 # Train the model
 # -----------------------------------------------------------------------------------------
+import random
 for run in range(args.n_runs):
 
     # REPRODUCTIBILITY
     if args.reproc:
-        np.random.seed(run)
+
         torch.manual_seed(run)
+        np.random.seed(run)
+        random.seed(run)
+        torch.cuda.manual_seed_all(run)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
     # CLASSIFIER
     if args.use_conv:
         if args.imprint:
@@ -189,7 +193,7 @@ for run in range(args.n_runs):
                 model = retrieve_replay_update(args,
                                     model, opt, data, target, buffer, task, tr_loader,rehearse=task>0)
 
-            buffer.add_reservoir(data, target, None, task)
+            buffer.add_reservoir(data.cpu(), target.cpu(), None, task)
 
         # ------------------------ eval ------------------------ #
         model = model.eval()

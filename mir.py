@@ -6,7 +6,8 @@ import pdb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import get_grad_vector, get_future_step_parameters,add_grad,get_weight_accumelated_gradient_norm,weight_gradient_norm,get_future_step_parameters_with_grads
+import utils
+from utils import get_grad_vector, get_future_step_parameters,add_grad,get_weight_accumelated_gradient_norm,weight_gradient_norm,get_future_step_parameters_with_grads,get_nearbysamples,get_mask_unused_memories,get_weight_norm_diff
 from VAE.loss import calculate_loss
 
 #----------
@@ -310,15 +311,21 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
     logits = model.linear(hid)
     if args.multiple_heads:
         logits = logits.masked_fill(loader.dataset.mask == 0, -1e9)
-    loss_a = F.cross_entropy(logits, input_y, reduction='none')
-    loss = (loss_a).sum() / loss_a.size(0)
+
+
 
     opt.zero_grad()
-    loss.backward()
-    if args.friction:
-        get_weight_accumelated_gradient_norm(model)
-    if not rehearse:
 
+    if not rehearse:
+        loss_a = F.cross_entropy(logits, input_y, reduction='none')
+        loss = (loss_a).sum() / loss_a.size(0)
+        loss.backward()
+
+        if args.friction:
+            get_weight_accumelated_gradient_norm(model)
+        if args.kl_far == -1:#it was a dummy parameter to try normalizing the last layer weights
+            weight_loss = get_weight_norm_diff(model,task=task,cl=5)
+            weight_loss.backward()
         opt.step()
 
         return model
@@ -326,6 +333,10 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 #####################################################################################################
     if args.method == 'mir_replay':
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
+        if args.cuda:
+            bx = bx.to(args.device)
+            by = by.to(args.device)
+            bt = bt.to(args.device)
         grad_dims = []
         for param in model.parameters():
             grad_dims.append(param.data.numel())
@@ -362,173 +373,72 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
 
         mem_x, mem_y, logits_y, b_task_ids = bx[big_ind], by[big_ind], buffer.logits[idx], bt[big_ind]
 
+        logits_buffer = model(mem_x)
+
+        if args.mask:
+            yy = torch.cat((input_y, mem_y), dim=0)
+            mask=get_mask_unused_memories(yy,logits.size(1))
+            logits = logits.masked_fill(mask, 1e-9)
+            logits_buffer=logits_buffer.masked_fill(mask, 1e-9)
+
+        F.cross_entropy(logits, input_y).backward()
+
+        (args.multiplier*F.cross_entropy(logits_buffer, mem_y)).backward()
 ##############################Nearest Neighbours###############################################
-    if args.method == 'oth_cl_neib_replay':
-        bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
 
-        #get representation
-        model.eval()
-        b_hidden= model.return_hidden(bx)
-        input_hidden= model.return_hidden(input_x)
-        model.train()
-
-        indices=[]
-        buffer_per_sample=int(args.buffer_batch_size/input_x.size(0))
-
-        for sample in input_hidden:
-            pdist = nn.PairwiseDistance(p=2)
-            input_rep = sample.repeat(b_hidden.size(0),1)
-
-            dist_to_all = pdist(b_hidden, input_rep)
-
-            _,sorted_indices = torch.sort(dist_to_all)
-            added=0
-            #pdb.set_trace()
-            for new_added_index in sorted_indices:
-
-                if not new_added_index in indices:
-                    indices.append(new_added_index)
-                    added+=1
-                    if added==buffer_per_sample:
-                        break
-
-        indices=torch.tensor(indices)
-        mem_x=bx[indices]
-        mem_y= by[indices]
-        bt = bt[indices]
-##################################################################################
-    if args.method == 'oth_cl_neib_replay_far_fix':
-
-        bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
-        grad_dims = []
-        for param in model.parameters():
-            grad_dims.append(param.data.numel())
-        grad_vector = get_grad_vector(args, model.parameters, grad_dims)
-        model_temp = get_future_step_parameters(model, grad_vector, grad_dims, lr=args.lr)
-        model_temp.zero_grad()
-
-        b_hidden = model.return_hidden(bx)
-        input_hidden = model.return_hidden(input_x)
-
-        # dist_to_all=torch.zeros(bx.size(0)).cuda()+1e4
-        close_indices = []
-        far_indices=[]
-        buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
-        for sample in input_hidden:
-            pdist = nn.PairwiseDistance(p=2)
-            input_rep = sample.repeat(b_hidden.size(0), 1)
-
-            dist_to_all = pdist(b_hidden, input_rep)
-
-            _, sorted_indices = torch.sort(dist_to_all)
-            added = 0
-
-            backward_index=len(sorted_indices)-1
-            for new_added_index in sorted_indices:
-
-                if not new_added_index in close_indices:
-                    close_indices.append(new_added_index)
-                    added += 1
-
-
-                if added == buffer_per_sample:
-                    break
-
-            while backward_index>=0:
-                if not sorted_indices[backward_index] in far_indices  and not sorted_indices[backward_index] in close_indices:
-                    far_indices.append(sorted_indices[backward_index])
-                    break
-                backward_index -= 1
-
-        close_indices = torch.tensor(close_indices)
-
-        mem_x = bx[close_indices]
-        mem_y = by[close_indices]
-        bt = bt[close_indices]
-
-        far_indices = torch.tensor(far_indices)
-        with torch.no_grad():
-            curr_bf_hidden=model(bx[far_indices])
-
-        KL =args.kl_far*dist_kl(curr_bf_hidden, model_temp(bx[far_indices]))
-        KL.backward()
-        meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
-        add_grad(model.parameters, meta_grad_vector, grad_dims)
-###########################################################################################
+#########################Nearest Neighbours and Making Updated Local#################################################
     if args.method == 'oth_cl_neib_replay_mid_fix':
-
+        #subsampling
         bx, by, bt, subsample = buffer.sample(args.subsample, exclude_task=task, ret_ind=True)
-
+        #get hidden representation
         model.eval()
         b_hidden = model.return_hidden(bx)
         input_hidden = model.return_hidden(input_x)
         model.train()
-        # Updating nearby samples
-        close_indices = []
-
-        all_dist=torch.zeros(args.subsample).cuda()
-        buffer_per_sample = int(args.buffer_batch_size / input_x.size(0))
-        for sample in input_hidden:
-            pdist = nn.PairwiseDistance(p=2)
-            input_rep = sample.repeat(b_hidden.size(0), 1)
-
-            dist_to_all = pdist(b_hidden, input_rep)
-            all_dist+=dist_to_all
-            _, sorted_indices = torch.sort(dist_to_all)
-            added = 0
-            for new_added_index in sorted_indices:
-
-                if not new_added_index in close_indices:
-                    close_indices.append(new_added_index)
-                    added += 1
-
-                if added == buffer_per_sample:
-                    break
+        # get nearby samples
+        close_indices, all_dist = get_nearbysamples(args, input_x, input_hidden, b_hidden,by)
         #Not neighbouring indices
-
-       
         _, sorted_indices = torch.sort(all_dist/args.buffer_batch_size)
         not_neighnor_inds=[ x for x in sorted_indices if x not in close_indices]
-        far_indices = torch.tensor(not_neighnor_inds[int(len(not_neighnor_inds) /2):min(len(not_neighnor_inds),int(len(not_neighnor_inds) /2)+len(close_indices))])
+        if args.far:#fix the furthest points
+            far_indices = torch.tensor(not_neighnor_inds[-len(close_indices):])
+        else:#fix the mid points
+            far_indices = torch.tensor(not_neighnor_inds[int(len(not_neighnor_inds) /2):min(len(not_neighnor_inds),int(len(not_neighnor_inds) /2)+len(close_indices))])
 
+
+        #get corresponding samples of neighbours and far samples
         close_indices = torch.tensor(close_indices)
-
         mem_x = bx[close_indices]
         mem_y = by[close_indices]
-        bt = bt[close_indices]
-
-        #FIXING KL
         logits_buffer = model(mem_x)
-        (args.multiplier * F.cross_entropy(logits_buffer, mem_y)).backward()
-        grad_dims = []
-        for param in model.parameters():
-            grad_dims.append(param.data.numel())
-        grad_vector = get_grad_vector(args, model.parameters, grad_dims)
-        model_temp = get_future_step_parameters_with_grads(model, grad_vector, grad_dims, lr=args.lr)
         far_indices = torch.tensor(far_indices)
-        #with torch.no_grad():
-        #    curr_bf_hidden=model(bx[far_indices])
+        far_mem_x = bx[far_indices]
+        if args.untilconvergence:
+            utils.optimize(args,model,opt,input_x,input_y,mem_x,mem_y,far_mem_x,task)
+            return model
+        else:
+            utils.compute_lossgrad(args,model,input_x,input_y,mem_x,mem_y,far_mem_x)
 
-        #KL=args.kl_far * distillation_KL_loss( model_temp(bx[far_indices]),curr_bf_hidden,T=2)
-        #KL =args.kl_far*dist_kl( model_temp(bx[far_indices]),curr_bf_hidden)
-        KL=- args.kl_far *(F.softmax(model(bx[far_indices]).detach(), dim=1) * F.log_softmax(model_temp(bx[far_indices]), dim=1)).sum(dim=1).mean()
 
-        KL.backward()
-        meta_grad_vector = get_grad_vector(args, model_temp.parameters, grad_dims)
-        add_grad(model.parameters, meta_grad_vector, grad_dims)
+####################################RAND########################################
 
-##############################################################################################
-    if args.method== 'rand_replay':
+
+    if  args.method == 'rand_replay':
+
         mem_x, mem_y, bt = buffer.sample(args.buffer_batch_size, exclude_task=task)
-    if not   args.method == 'oth_cl_neib_replay_mid_fix':
+        if args.untilconvergence:
+            utils.rand_optimize(args,model,opt,input_x,input_y,mem_x,mem_y,task)
+            return model
+
         logits_buffer = model(mem_x)
-        if args.multiple_heads:
-            mask = torch.zeros_like(logits_buffer)
-            mask.scatter_(1, loader.dataset.task_ids[b_task_ids], 1)
-            assert mask.nelement() // mask.sum() == args.n_tasks
-            logits_buffer = logits_buffer.masked_fill(mask == 0, -1e9)
 
+        if args.mask:
+            yy = torch.cat((input_y, mem_y), dim=0)
+            mask=get_mask_unused_memories(yy,logits.size(1))
+            logits = logits.masked_fill(mask, 1e-9)
+            logits_buffer=logits_buffer.masked_fill(mask, 1e-9)
 
+        F.cross_entropy(logits, input_y).backward()
 
         (args.multiplier*F.cross_entropy(logits_buffer, mem_y)).backward()
 
@@ -539,8 +449,9 @@ def retrieve_replay_update(args, model, opt, input_x, input_y, buffer, task, loa
     if args.friction:
         get_weight_accumelated_gradient_norm(model)
         weight_gradient_norm(model,args.friction)
-
-
+    if args.kl_far==-1:
+        weight_loss=get_weight_norm_diff(model,task=task,cl=5)
+        weight_loss.backward()
     opt.step()
 
     return model
